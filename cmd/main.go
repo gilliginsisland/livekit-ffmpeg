@@ -2,66 +2,43 @@ package main
 
 import (
     "context"
+    "errors"
     "flag"
     "fmt"
     "io"
     "log"
+    "net"
     "os"
     "os/exec"
     "os/signal"
-    "strconv"
+    "strings"
     "sync"
     "syscall"
 
     lksdk "github.com/livekit/server-sdk-go/v2"
-    "github.com/pion/interceptor"
+    "github.com/pion/rtp"
+    "github.com/pion/sdp/v3"
     "github.com/pion/webrtc/v4"
 )
 
-// TrackWriter handles writing RTP packets to a destination
-type TrackReader struct {
-    track interface {
-        Read(b []byte) (n int, attributes interceptor.Attributes, err error)
-    }
-}
-
-func (tr *TrackReader) Read(b []byte) (int, error) {
-    n, _, err := tr.track.Read(b)
-    return n, err
-}
-
 // FFMpeg manages the FFmpeg process and input file descriptors
 type FFMpeg struct {
-    fds    []*os.File
-    cmd    *exec.Cmd
-    cancel func()
-}
-
-// TrackPipe creates a new pipe and returns an RTPWriter for writing to it, adding the read end to extraFiles
-func (f *FFMpeg) TrackPipe() (*os.File, error) {
-    r, w, err := os.Pipe()
-    if err != nil {
-        return nil, fmt.Errorf("failed to create pipe: %v", err)
-    }
-    f.fds = append(f.fds, r)
-    return w, nil
+    cmd *exec.Cmd
+    SDP string
 }
 
 // Start constructs and starts the FFmpeg process with the configured inputs and user-provided extraArgs
 func (f *FFMpeg) StartContext(ctx context.Context, outputArgs []string) error {
-    var args []string
-    for i := range f.fds {
-        // Extra FDs start at 3 (after 0=stdin, 1=stdout, 2=stderr)
-        args = append(args, "-i", "fd:", "-fd", strconv.Itoa(3+i))
-        // Add mapping for this input to allow all tracks
-        args = append(args, "-map", fmt.Sprintf("%d", i))
-    }
-    args = append(args, outputArgs...)
+    args := append([]string{
+        "-protocol_whitelist",
+        "udp,rtp,pipe",
+        "-i", "pipe:0",
+    }, outputArgs...)
 
     f.cmd = exec.CommandContext(ctx, "ffmpeg", args...)
-    f.cmd.ExtraFiles = f.fds
     f.cmd.Stdout = os.Stdout
     f.cmd.Stderr = os.Stderr
+    f.cmd.Stdin = strings.NewReader(f.SDP)
 
     // Start the FFmpeg process
     if err := f.cmd.Start(); err != nil {
@@ -88,33 +65,137 @@ func main() {
     ctx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT)
     // ctx, stop := context.WithCancel(ctx)
 
-    var ffmpeg FFMpeg
+    // Prepare udp conns
+    // Also update incoming packets with expected PayloadType, the browser may use
+    // a different value. We have to modify so our stream matches what rtp-forwarder.sdp expects
+    conns := map[webrtc.RTPCodecType]*RTPConn{
+        webrtc.RTPCodecTypeAudio: {Port: 4000, Type: 111},
+        webrtc.RTPCodecTypeVideo: {Port: 4002, Type: 96},
+    }
+    for _, conn := range conns {
+        var err error
+        if conn.Conn, err = net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", conn.Port)); err != nil {
+            panic(err)
+        }
+        defer func(conn net.Conn) {
+            if err := conn.Close(); err != nil {
+                panic(err)
+            }
+        }(conn.Conn)
+    }
+
+    s := &sdp.SessionDescription{
+        Version: 0,
+        Origin: sdp.Origin{
+            Username:       "-",
+            SessionID:      0,
+            SessionVersion: 0,
+            NetworkType:    "IN",
+            AddressType:    "IP4",
+            UnicastAddress: "127.0.0.1",
+        },
+        ConnectionInformation: &sdp.ConnectionInformation{
+            NetworkType: "IN",
+            AddressType: "IP4",
+            Address:     &sdp.Address{Address: "127.0.0.1"},
+        },
+        SessionName: "LiveKit WebRTC",
+        TimeDescriptions: []sdp.TimeDescription{
+            {Timing: sdp.Timing{StartTime: 0, StopTime: 0}},
+        },
+    }
+
+    var (
+        mu   sync.Mutex
+        cond = sync.NewCond(&mu)
+    )
+    context.AfterFunc(ctx, cond.Signal)
+
     var wg sync.WaitGroup
-    codecTypes := make(chan webrtc.RTPCodecType, 2)
 
     room := lksdk.NewRoom(&lksdk.RoomCallback{
         ParticipantCallback: lksdk.ParticipantCallback{
             OnTrackSubscribed: func(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-                trackID := track.ID()
-                mediaType := track.Kind()
-
-                // Add input to FFMpeg and get an RTPWriter
-                writer, err := ffmpeg.TrackPipe()
-                if err != nil {
-                    log.Printf("Failed to add track %s: %v", trackID, err)
+                conn, ok := conns[track.Kind()]
+                if !ok {
                     return
                 }
-                log.Printf("Track subscribed: %s (Kind: %s)", trackID, mediaType.String())
 
-                // Schedule CopyRTP using WaitGroup.Go (starts the goroutine immediately, pipe buffering handles timing)
+                params := track.Codec()
+                _, encoding, _ := strings.Cut(params.MimeType, "/")
+                if encoding == "" {
+                    return
+                }
+                encoding = strings.ToUpper(encoding)
+
+                var rtpmap string
+                switch track.Kind() {
+                case webrtc.RTPCodecTypeAudio:
+                    rtpmap = fmt.Sprintf("%d %s/%d/%d", conn.Type, encoding, params.ClockRate, params.Channels)
+                case webrtc.RTPCodecTypeVideo:
+                    rtpmap = fmt.Sprintf("%d %s/%d", conn.Type, encoding, params.ClockRate)
+                }
+
+                md := &sdp.MediaDescription{
+                    MediaName: sdp.MediaName{
+                        Media:   track.Kind().String(),
+                        Port:    sdp.RangedPort{Value: conn.Port},
+                        Protos:  []string{"RTP", "AVP"},
+                        Formats: []string{fmt.Sprintf("%d", conn.Type)},
+                    },
+                    Attributes: []sdp.Attribute{
+                        {Key: "rtpmap", Value: rtpmap},
+                    },
+                }
+                if params.SDPFmtpLine != "" {
+                    md.WithValueAttribute("fmtp", fmt.Sprintf("%d %s", conn.Type, params.SDPFmtpLine))
+                }
+                mu.Lock()
+                s.WithMedia(md)
+                mu.Unlock()
+                cond.Signal()
+
                 wg.Go(func() {
-                    defer writer.Close()
-                    if _, err := io.Copy(writer, &TrackReader{track}); err != nil {
-                        log.Printf("Copy failed for track %s: %v", trackID, err)
+                    buf := make([]byte, 1500)
+                    pkt := &rtp.Packet{}
+
+                    for {
+                        // Read
+                        n, _, err := track.Read(buf)
+                        if err == io.EOF {
+                            break
+                        }
+                        if err != nil {
+                            panic(err)
+                        }
+
+                        // Unmarshal the packet and update the PayloadType
+                        if err = pkt.Unmarshal(buf[:n]); err != nil {
+                            panic(err)
+                        }
+                        pkt.PayloadType = conn.Type
+
+                        // Marshal into original buffer with updated PayloadType
+                        if n, err = pkt.MarshalTo(buf); err != nil {
+                            panic(err)
+                        }
+
+                        // Write
+                        if _, err = conn.Write(buf[:n]); err != nil {
+                            // For this particular example, third party applications usually timeout after a short
+                            // amount of time during which the user doesn't have enough time to provide the answer
+                            // to the browser.
+                            // That's why, for this particular example, the user first needs to provide the answer
+                            // to the browser then open the third party application. Therefore we must not kill
+                            // the forward on "connection refused" errors
+                            var opError *net.OpError
+                            if errors.As(err, &opError) && opError.Err.Error() == "write: connection refused" {
+                                continue
+                            }
+                            panic(err)
+                        }
                     }
                 })
-
-                codecTypes <- mediaType
             },
         },
     })
@@ -124,30 +205,28 @@ func main() {
         log.Fatalf("Failed to connect to livekit room: %v", err)
     }
 
-    func() {
-        var (
-            haveAudio bool
-            haveVideo bool
-        )
-        for !haveAudio || !haveVideo {
-            select {
-            case <-ctx.Done():
-                return
-            case codecType := <-codecTypes:
-                switch codecType {
-                case webrtc.RTPCodecTypeAudio:
-                    haveAudio = true
-                case webrtc.RTPCodecTypeVideo:
-                    haveVideo = true
-                }
-            }
-        }
-    }()
-
+    mu.Lock()
+    for len(s.MediaDescriptions) < 2 {
+        cond.Wait()
+    }
+    var ffmpeg FFMpeg
+    if b, err := s.Marshal(); err != nil {
+        panic(err)
+    } else {
+        ffmpeg.SDP = string(b)
+    }
+    mu.Unlock()
+    log.Println(ffmpeg.SDP)
     if err := ffmpeg.StartContext(ctx, ffmpegArgs); err != nil {
         log.Fatalf("Failed to start FFmpeg: %v", err)
     }
 
     // Wait for all track processing to complete
     ffmpeg.Wait()
+}
+
+type RTPConn struct {
+    net.Conn
+    Port int
+    Type uint8
 }
