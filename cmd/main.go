@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -63,7 +64,7 @@ func main() {
 	room := lksdk.NewRoom(&lksdk.RoomCallback{
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-				port, err := FreeRTPPort("udp")
+				port, err := FreeRTPPort()
 				if err != nil {
 					log.Fatal(err)
 				}
@@ -160,30 +161,33 @@ func main() {
 	ffmpeg.Wait()
 }
 
-// FreePort asks the kernel for a free open port that is ready to use.
+// FreeUDPPort asks the kernel for a free open port that is ready to use.
 func FreePort(network string) (int, error) {
+	var address string
 	switch network {
-	case "tcp", "tcp4", "tcp6":
-		l, err := net.ListenTCP(network, &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
-		if err != nil {
-			return 0, err
-		}
-		return l.Addr().(*net.TCPAddr).Port, nil
 	case "udp", "udp4", "udp6":
-		l, err := net.ListenUDP(network, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		l, err := reuseListenPacket(network, ":0")
 		if err != nil {
 			return 0, err
 		}
-		return l.LocalAddr().(*net.UDPAddr).Port, nil
+		address = l.LocalAddr().String()
+		defer l.Close()
 	default:
-		return 0, fmt.Errorf("unexpected network %q", network)
+		return 0, fmt.Errorf("unexpected address type")
 	}
+
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return 0, err
+	}
+
+	return strconv.Atoi(port)
 }
 
 // FreeRTPPort finds a free even port for RTP use.
-func FreeRTPPort(network string) (int, error) {
+func FreeRTPPort() (int, error) {
 	for {
-		port, err := FreePort(network)
+		port, err := FreePort("udp")
 		if err != nil {
 			return 0, err
 		}
@@ -192,7 +196,7 @@ func FreeRTPPort(network string) (int, error) {
 		}
 		// If port is odd, try the next even port
 		port += 1
-		l, err := net.Listen(network, fmt.Sprintf(":%d", port))
+		l, err := reuseListenPacket("udp", fmt.Sprintf(":%d", port))
 		if err != nil {
 			// loop again to get a new free port
 			continue
@@ -200,6 +204,28 @@ func FreeRTPPort(network string) (int, error) {
 		defer l.Close()
 		return port, nil
 	}
+}
+
+// reusePortListen sets up a listener with SO_REUSEADDR enabled.
+func reuseListenPacket(network, address string) (net.PacketConn, error) {
+	switch network {
+	case "udp", "udp4", "udp6":
+	default:
+		return nil, fmt.Errorf("unexpected address type")
+	}
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			err := c.Control(func(fd uintptr) {
+				opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
+			})
+			if err != nil {
+				return err
+			}
+			return opErr
+		},
+	}
+	return lc.ListenPacket(context.Background(), network, address)
 }
 
 // FFMpeg manages the FFmpeg process and input file descriptors
