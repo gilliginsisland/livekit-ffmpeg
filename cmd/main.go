@@ -136,13 +136,17 @@ func main() {
 		},
 	})
 	context.AfterFunc(ctx, room.Disconnect)
+	context.AfterFunc(ctx, cond.Signal)
 
 	if err := room.JoinWithToken(*url, *token); err != nil {
-		log.Fatalf("Failed to connect to livekit room: %v", err)
+		log.Fatalf("Failed to connect to livekit room: %w", err)
 	}
 
 	mu.Lock()
 	for len(s.MediaDescriptions) < 2 {
+		if err := ctx.Err(); err != nil {
+			log.Fatalf("User cancelled: %w", err)
+		}
 		cond.Wait()
 	}
 	var ffmpeg FFMpeg
