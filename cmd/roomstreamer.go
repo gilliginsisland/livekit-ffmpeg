@@ -35,16 +35,19 @@ func NewRoomStreamer(details ConnecterFunc) *RoomStreamer {
 	rs.room = lksdk.NewRoom(&lksdk.RoomCallback{
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-				ts := TrackStreamer{Track: track}
+				ts, err := NewTrackStreamer(track)
+				if err != nil {
+					return
+				}
 				// Try to assign track based on kind
 				switch track.Kind() {
 				case webrtc.RTPCodecTypeAudio:
-					if !rs.audio.CompareAndSwap(nil, &ts) {
+					if !rs.audio.CompareAndSwap(nil, ts) {
 						log.Printf("Audio track skipped, already exists")
 						return
 					}
 				case webrtc.RTPCodecTypeVideo:
-					if !rs.video.CompareAndSwap(nil, &ts) {
+					if !rs.video.CompareAndSwap(nil, ts) {
 						log.Printf("Video track skipped, already exists")
 						return
 					}

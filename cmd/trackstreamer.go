@@ -44,11 +44,11 @@ func NewTrackStreamer(track *webrtc.TrackRemote) (*TrackStreamer, error) {
 	)
 	pmd.WithMediaSource(uint32(track.SSRC()), "", "", track.ID())
 
-	var ts TrackStreamer
-	ts.ctx, ts.cancel = context.WithCancel(context.Background())
+	ts := TrackStreamer{Track: track}
 	if err := ts.md.Unmarshal(pmd); err != nil {
 		return nil, err
 	}
+	ts.ctx, ts.cancel = context.WithCancel(context.Background())
 	return &ts, nil
 }
 
