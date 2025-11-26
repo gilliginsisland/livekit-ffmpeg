@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	lksdk "github.com/livekit/server-sdk-go/v2"
 	"github.com/pion/sdp/v3"
@@ -59,8 +60,6 @@ func main() {
 	)
 	context.AfterFunc(ctx, cond.Signal)
 
-	var wg sync.WaitGroup
-
 	room := lksdk.NewRoom(&lksdk.RoomCallback{
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
@@ -99,7 +98,7 @@ func main() {
 				mu.Unlock()
 				cond.Signal()
 
-				wg.Go(func() {
+				go func() {
 					conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
 					if err != nil {
 						log.Fatal(err)
@@ -131,7 +130,22 @@ func main() {
 							log.Fatal(err)
 						}
 					}
-				})
+				}()
+
+				go func() {
+					// Create a new ticker that fires every 2 seconds.
+					ticker := time.NewTicker(2 * time.Second)
+					defer ticker.Stop()
+					ssrc := track.SSRC()
+					for {
+						rp.WritePLI(ssrc)
+						select {
+						case <-ctx.Done():
+							return
+						case <-ticker.C:
+						}
+					}
+				}()
 			},
 		},
 	})
