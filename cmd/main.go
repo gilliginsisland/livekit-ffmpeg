@@ -10,12 +10,7 @@ import (
 	"syscall"
 
 	"github.com/bluenviron/gortsplib/v5"
-	"github.com/go-logr/stdr"
 )
-
-func init() {
-	stdr.SetVerbosity(10)
-}
 
 func main() {
 	// App flags

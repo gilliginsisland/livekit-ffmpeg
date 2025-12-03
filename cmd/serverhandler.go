@@ -1,8 +1,9 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -26,30 +27,33 @@ type PacketRTPWriter interface {
 
 // Ensure ServerHandler implements the necessary interfaces
 var (
-	_ gortsplib.ServerHandlerOnConnOpen         = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnConnClose        = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnSessionOpen      = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnSessionClose     = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnRequest          = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnResponse         = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnDescribe         = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnAnnounce         = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnSetup            = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnPlay             = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnRecord           = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnPause            = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnGetParameter     = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnSetParameter     = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnPacketsLost      = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnDecodeError      = (*ServerHandler)(nil)
-	_ gortsplib.ServerHandlerOnStreamWriteError = (*ServerHandler)(nil)
+	_ gortsplib.ServerHandlerOnConnOpen  = (*ServerHandler)(nil)
+	_ gortsplib.ServerHandlerOnConnClose = (*ServerHandler)(nil)
+	_ gortsplib.ServerHandlerOnRequest   = (*ServerHandler)(nil)
+	_ gortsplib.ServerHandlerOnResponse  = (*ServerHandler)(nil)
+	_ gortsplib.ServerHandlerOnDescribe  = (*ServerHandler)(nil)
+	_ gortsplib.ServerHandlerOnSetup     = (*ServerHandler)(nil)
+	_ gortsplib.ServerHandlerOnPlay      = (*ServerHandler)(nil)
+	_ gortsplib.ServerHandlerOnPause     = (*ServerHandler)(nil)
 )
 
 // route holds a streamer and its associated server stream for a specific path.
 type route struct {
 	Streamer Streamer
 	Stream   *gortsplib.ServerStream
-	count    atomic.Uint32
+	count    atomic.Int32
+}
+
+// UserData holds the context and cancel function for a connection.
+type UserData struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// NewUserData creates a new connUserData with a cancellable context.
+func NewUserData() *UserData {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &UserData{ctx: ctx, cancel: cancel}
 }
 
 // StreamerFactory defines a function to create a Streamer for a given path and query parameters.
@@ -71,135 +75,145 @@ func NewServerHandler(factory StreamerFactory) *ServerHandler {
 	}
 }
 
-func (h *ServerHandler) initialize(path string, query url.Values) (*base.Response, *gortsplib.ServerStream, error) {
+func (h *ServerHandler) getOrCreateRoute(path string, query url.Values) (*route, error) {
 	h.mu.RLock()
 	{
 		r, exists := h.routes[path]
 		h.mu.RUnlock()
 		if exists {
-			return &base.Response{
-				StatusCode: base.StatusOK,
-			}, r.Stream, nil
+			return r, nil
 		}
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Retrieve or create the route for the path
+	// Double-check after acquiring write lock
 	if r, exists := h.routes[path]; exists {
-		return &base.Response{
-			StatusCode: base.StatusOK,
-		}, r.Stream, nil
+		return r, nil
 	}
 
 	// Use the factory to create a new streamer
 	streamer, err := h.Factory(path, query)
 	if err != nil {
-		return &base.Response{
-			StatusCode: base.StatusBadGateway,
-		}, nil, fmt.Errorf("failed to create streamer for path %s: %w", path, err)
+		return nil, fmt.Errorf("failed to create streamer for path %s: %w", path, err)
 	}
 
 	// Get media descriptions from streamer
 	medias, err := streamer.Describe()
 	if err != nil {
-		return &base.Response{
-			StatusCode: base.StatusBadGateway,
-		}, nil, fmt.Errorf("failed to get media descriptions for path %s: %w", path, err)
+		streamer.Close()
+		return nil, fmt.Errorf("failed to get media descriptions for path %s: %w", path, err)
 	}
 
 	stream := &gortsplib.ServerStream{
 		Server: h.Server,
 		Desc: &description.Session{
-			// BaseURL: ,
 			Medias: medias,
 		},
 	}
 	if err := stream.Initialize(); err != nil {
+		streamer.Close()
+		return nil, err
+	}
+
+	r := &route{
+		Streamer: streamer,
+		Stream:   stream,
+	}
+	h.routes[path] = r
+
+	go func() {
+		streamer.Stream(stream)
+		h.mu.Lock()
+		delete(h.routes, path)
+		h.mu.Unlock()
+		r.Stream.Close()
+		r.Streamer.Close()
+	}()
+
+	return r, nil
+}
+
+func (h *ServerHandler) onStreamRequest(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
+	// Get user data from connection
+	ud, ok := ctx.Conn.UserData().(*UserData)
+	if !ok {
+		return &base.Response{
+			StatusCode: base.StatusInternalServerError,
+		}, nil, fmt.Errorf("no user data in connection")
+	}
+
+	r, err := h.getOrCreateRoute(ctx.Path, (*url.URL)(ctx.Request.URL).Query())
+	if err != nil {
 		return &base.Response{
 			StatusCode: base.StatusBadGateway,
 		}, nil, err
 	}
 
-	h.routes[path] = &route{
-		Streamer: streamer,
-		Stream:   stream,
-	}
-
-	go func() {
-		streamer.Stream(stream)
+	r.count.Add(1)
+	context.AfterFunc(ud.ctx, func() {
+		if c := r.count.Add(-1); c > 0 {
+			return
+		}
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		if r, exists := h.routes[path]; exists && r.Streamer == streamer {
-			delete(h.routes, path)
+		if r.count.Load() > 0 {
+			return
 		}
-	}()
+		delete(h.routes, ctx.Path)
+		r.Streamer.Close()
+	})
 
 	return &base.Response{
 		StatusCode: base.StatusOK,
-	}, stream, nil
-}
-
-func (h *ServerHandler) OnSessionOpen(ctx *gortsplib.ServerHandlerOnSessionOpenCtx) {
-	log.Println("OnSessionOpen called")
-}
-
-func (h *ServerHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
-	log.Println("OnSessionClose called")
+	}, r.Stream, nil
 }
 
 // OnDescribe handles the RTSP DESCRIBE request, initializing the stream for the requested path if necessary.
 func (h *ServerHandler) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	log.Println("OnDescribe called for path:", ctx.Path)
-	return h.initialize(ctx.Path, (*url.URL)(ctx.Request.URL).Query())
+	slog.Debug("OnDescribe called for path:", ctx.Path)
+	return h.onStreamRequest(ctx)
 }
 
 // OnSetup handles the RTSP SETUP request, returning the stream for the requested path.
 func (h *ServerHandler) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	log.Println("OnSetup called for path:", ctx.Path)
-	return h.initialize(ctx.Path, (*url.URL)(ctx.Request.URL).Query())
+	slog.Debug("OnSetup called for path:", ctx.Path)
+	return h.onStreamRequest(&gortsplib.ServerHandlerOnDescribeCtx{
+		Conn:    ctx.Conn,
+		Request: ctx.Request,
+		Path:    ctx.Path,
+		Query:   ctx.Query,
+	})
 }
 
-// OnConnOpen logs when a connection is opened.
+// OnConnOpen sets up user data with a cancellable context.
 func (h *ServerHandler) OnConnOpen(ctx *gortsplib.ServerHandlerOnConnOpenCtx) {
-	log.Println("OnConnOpen called")
+	slog.Debug("OnConnOpen called")
+	ctx.Conn.SetUserData(NewUserData())
 }
 
-// OnConnClose logs when a connection is closed.
+// OnConnClose cancels the context, triggering cleanup of routes.
 func (h *ServerHandler) OnConnClose(ctx *gortsplib.ServerHandlerOnConnCloseCtx) {
-	log.Println("OnConnClose called")
+	slog.Debug("OnConnClose called")
+	if ud, ok := ctx.Conn.UserData().(*UserData); ok {
+		ud.cancel()
+	}
 }
 
 // OnRequest logs when a request is received from a connection.
 func (h *ServerHandler) OnRequest(conn *gortsplib.ServerConn, req *base.Request) {
-	log.Println("OnRequest called: %s", req)
+	slog.Debug("OnRequest called", slog.String("req", req.String()))
 }
 
 // OnResponse logs when a response is sent to a connection.
 func (h *ServerHandler) OnResponse(conn *gortsplib.ServerConn, res *base.Response) {
-	log.Println("OnResponse called: %s", res)
-}
-
-// OnAnnounce logs when an ANNOUNCE request is received.
-func (h *ServerHandler) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
-	log.Println("OnAnnounce called")
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, nil
+	slog.Debug("OnResponse called: %s", res)
 }
 
 // OnPlay logs when a PLAY request is received.
 func (h *ServerHandler) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
-	log.Println("OnPlay called")
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, nil
-}
-
-// OnRecord logs when a RECORD request is received.
-func (h *ServerHandler) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
-	log.Println("OnRecord called")
+	slog.Debug("OnPlay called")
 	return &base.Response{
 		StatusCode: base.StatusOK,
 	}, nil
@@ -207,39 +221,8 @@ func (h *ServerHandler) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base
 
 // OnPause logs when a PAUSE request is received.
 func (h *ServerHandler) OnPause(ctx *gortsplib.ServerHandlerOnPauseCtx) (*base.Response, error) {
-	log.Println("OnPause called")
+	slog.Debug("OnPause called")
 	return &base.Response{
 		StatusCode: base.StatusOK,
 	}, nil
-}
-
-// OnGetParameter logs when a GET_PARAMETER request is received.
-func (h *ServerHandler) OnGetParameter(ctx *gortsplib.ServerHandlerOnGetParameterCtx) (*base.Response, error) {
-	log.Println("OnGetParameter called")
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, nil
-}
-
-// OnSetParameter logs when a SET_PARAMETER request is received.
-func (h *ServerHandler) OnSetParameter(ctx *gortsplib.ServerHandlerOnSetParameterCtx) (*base.Response, error) {
-	log.Println("OnSetParameter called")
-	return &base.Response{
-		StatusCode: base.StatusOK,
-	}, nil
-}
-
-// OnPacketsLost logs when the server detects lost packets.
-func (h *ServerHandler) OnPacketsLost(ctx *gortsplib.ServerHandlerOnPacketsLostCtx) {
-	log.Println("OnPacketsLost called")
-}
-
-// OnDecodeError logs when a non-fatal decode error occurs.
-func (h *ServerHandler) OnDecodeError(ctx *gortsplib.ServerHandlerOnDecodeErrorCtx) {
-	log.Println("OnDecodeError called")
-}
-
-// OnStreamWriteError logs when a ServerStream is unable to write packets to a session.
-func (h *ServerHandler) OnStreamWriteError(ctx *gortsplib.ServerHandlerOnStreamWriteErrorCtx) {
-	log.Println("OnStreamWriteError called")
 }
