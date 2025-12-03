@@ -1,16 +1,10 @@
 # Makefile for cross-compiling Go binaries for multiple platforms and architectures
 
-# Project name (used for binary naming)
-PROJECT_NAME = livekit-ffmpeg
-
 # Output directory for binaries
 BIN_DIR = bin
 
 # Go build flags
 GOFLAGS = -ldflags="-s -w" -trimpath
-
-# Source file
-SRC = cmd/main.go
 
 # Define OS-ARCH pairs
 PLATFORMS = \
@@ -19,24 +13,35 @@ PLATFORMS = \
 	linux-amd64 \
 	linux-arm64
 
-# Generate target list for all platforms
-TARGETS = $(foreach plat,$(PLATFORMS),$(BIN_DIR)/$(PROJECT_NAME)-$(plat))
+# Auto-discover commands in cmd directory
+CMDS = $(notdir $(wildcard cmd/*))
 
-# Default target: build for all platforms
+# Generate target list for all commands and platforms
+TARGETS = $(foreach cmd,$(CMDS),$(foreach plat,$(PLATFORMS),$(BIN_DIR)/livekit-$(cmd)-$(plat)))
+
+# Default target: build for all commands and platforms
 all: $(TARGETS)
 
-# Define a template for build rules
+# Define a template for build rules per command and platform
 define BUILD_RULE
-$(BIN_DIR)/$(PROJECT_NAME)-$(1): $(SRC)
+$(BIN_DIR)/livekit-$(1)-$(2):
 	@mkdir -p $(BIN_DIR)
-	CGO_ENABLED=0 GOOS=$(word 1,$(subst -, ,$(1))) GOARCH=$(word 2,$(subst -, ,$(1))) go build $(GOFLAGS) -o $$@ $$<
+	CGO_ENABLED=0 GOOS=$(word 1,$(subst -, ,$(2))) GOARCH=$(word 2,$(subst -, ,$(2))) go build $(GOFLAGS) -o $$@ ./cmd/$(1)
 
-.PHONY: $(1)
-$(1): $(BIN_DIR)/$(PROJECT_NAME)-$(1)
+.PHONY: $(1)-$(2)
+$(1)-$(2): $(BIN_DIR)/livekit-$(1)-$(2)
 endef
 
-# Apply the build rule template to each platform
-$(foreach plat,$(PLATFORMS),$(eval $(call BUILD_RULE,$(plat))))
+# Apply the build rule template to each command and platform combination
+$(foreach cmd,$(CMDS),$(foreach plat,$(PLATFORMS),$(eval $(call BUILD_RULE,$(cmd),$(plat)))))
+
+# Define per-command targets to build all platforms for a specific command
+define CMD_TARGET
+.PHONY: $(1)
+$(1): $(foreach plat,$(PLATFORMS),$(BIN_DIR)/livekit-$(1)-$(plat))
+endef
+
+$(foreach cmd,$(CMDS),$(eval $(call CMD_TARGET,$(cmd))))
 
 # Clean up binaries
 clean:
@@ -44,11 +49,12 @@ clean:
 
 # Help message
 help:
-	@echo "Makefile for cross-compiling $(PROJECT_NAME)"
+	@echo "Makefile for cross-compiling LiveKit binaries"
 	@echo "Targets:"
-	@echo "  all          - Build binaries for all platforms (default)"
-	@$(foreach plat,$(PLATFORMS),echo "  $(plat)  - Build for $(word 1,$(subst -, ,$(plat))) $(word 2,$(subst -, ,$(plat)))";)
+	@echo "  all          - Build binaries for all commands and platforms (default)"
+	@$(foreach cmd,$(CMDS),echo "  $(cmd)       - Build for command $(cmd) across all platforms";)
+	@$(foreach plat,$(PLATFORMS),echo "  <cmd>-$(plat) - Build specific command for $(word 1,$(subst -, ,$(plat))) $(word 2,$(subst -, ,$(plat)))";)
 	@echo "  clean        - Remove all built binaries"
 	@echo "  help         - Show this help message"
 
-.PHONY: all clean help
+.PHONY: all clean help $(CMDS)
