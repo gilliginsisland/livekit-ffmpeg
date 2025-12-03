@@ -20,6 +20,56 @@ github.com/benbjohnson/clock
 # github.com/bep/debounce v1.2.1
 ## explicit
 github.com/bep/debounce
+# github.com/bluenviron/gortsplib/v5 v5.1.1
+## explicit; go 1.24.0
+github.com/bluenviron/gortsplib/v5
+github.com/bluenviron/gortsplib/v5/internal/asyncprocessor
+github.com/bluenviron/gortsplib/v5/internal/base64streamreader
+github.com/bluenviron/gortsplib/v5/pkg/auth
+github.com/bluenviron/gortsplib/v5/pkg/base
+github.com/bluenviron/gortsplib/v5/pkg/bytecounter
+github.com/bluenviron/gortsplib/v5/pkg/conn
+github.com/bluenviron/gortsplib/v5/pkg/description
+github.com/bluenviron/gortsplib/v5/pkg/format
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpac3
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpav1
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpfragmented
+github.com/bluenviron/gortsplib/v5/pkg/format/rtph264
+github.com/bluenviron/gortsplib/v5/pkg/format/rtph265
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpklv
+github.com/bluenviron/gortsplib/v5/pkg/format/rtplpcm
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpmjpeg
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpmpeg1audio
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpmpeg1video
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpmpeg4audio
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpsimpleaudio
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpvp8
+github.com/bluenviron/gortsplib/v5/pkg/format/rtpvp9
+github.com/bluenviron/gortsplib/v5/pkg/headers
+github.com/bluenviron/gortsplib/v5/pkg/liberrors
+github.com/bluenviron/gortsplib/v5/pkg/mikey
+github.com/bluenviron/gortsplib/v5/pkg/multicast
+github.com/bluenviron/gortsplib/v5/pkg/ntp
+github.com/bluenviron/gortsplib/v5/pkg/readbuffer
+github.com/bluenviron/gortsplib/v5/pkg/ringbuffer
+github.com/bluenviron/gortsplib/v5/pkg/rtpreceiver
+github.com/bluenviron/gortsplib/v5/pkg/rtpsender
+github.com/bluenviron/gortsplib/v5/pkg/rtptime
+github.com/bluenviron/gortsplib/v5/pkg/sdp
+# github.com/bluenviron/mediacommon/v2 v2.5.1
+## explicit; go 1.24.0
+github.com/bluenviron/mediacommon/v2/pkg/bits
+github.com/bluenviron/mediacommon/v2/pkg/codecs/ac3
+github.com/bluenviron/mediacommon/v2/pkg/codecs/av1
+github.com/bluenviron/mediacommon/v2/pkg/codecs/h264
+github.com/bluenviron/mediacommon/v2/pkg/codecs/h265
+github.com/bluenviron/mediacommon/v2/pkg/codecs/jpeg
+github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg1audio
+github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio
+github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4video
+github.com/bluenviron/mediacommon/v2/pkg/codecs/vp8
+github.com/bluenviron/mediacommon/v2/pkg/codecs/vp9
+github.com/bluenviron/mediacommon/v2/pkg/rewindablereader
 # github.com/cespare/xxhash/v2 v2.3.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
@@ -205,8 +255,8 @@ github.com/pion/mdns/v2
 # github.com/pion/randutil v0.1.0
 ## explicit; go 1.14
 github.com/pion/randutil
-# github.com/pion/rtcp v1.2.15
-## explicit; go 1.20
+# github.com/pion/rtcp v1.2.16
+## explicit; go 1.21
 github.com/pion/rtcp
 # github.com/pion/rtp v1.8.25
 ## explicit; go 1.21
