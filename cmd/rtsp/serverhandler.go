@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bluenviron/gortsplib/v5"
 	"github.com/bluenviron/gortsplib/v5/pkg/base"
@@ -41,7 +42,19 @@ var (
 type route struct {
 	Streamer Streamer
 	Stream   *gortsplib.ServerStream
+	path     string
 	count    atomic.Int32
+	timer    *time.Timer
+	expires  atomic.Int64
+}
+
+func (r *route) Acquire() int32 {
+	r.timer.Stop()
+	return r.count.Add(1)
+}
+
+func (r *route) Release() int32 {
+	return r.count.Add(-1)
 }
 
 // UserData holds the context and cancel function for a connection.
@@ -79,17 +92,20 @@ func (h *ServerHandler) getOrCreateRoute(path string, query url.Values) (*route,
 	h.mu.RLock()
 	{
 		r, exists := h.routes[path]
-		h.mu.RUnlock()
 		if exists {
+			defer h.mu.RUnlock()
+			r.Acquire()
 			return r, nil
 		}
 	}
+	h.mu.RUnlock()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	// Double-check after acquiring write lock
 	if r, exists := h.routes[path]; exists {
+		r.Acquire()
 		return r, nil
 	}
 
@@ -120,16 +136,33 @@ func (h *ServerHandler) getOrCreateRoute(path string, query url.Values) (*route,
 	r := &route{
 		Streamer: streamer,
 		Stream:   stream,
+		path:     path,
 	}
+	r.timer = time.AfterFunc(30*time.Second, func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if r != h.routes[path] || r.count.Load() > 0 || r.expires.Load() > time.Now().UnixNano() {
+			return
+		}
+		delete(h.routes, path)
+		h.mu.Unlock()
+		streamer.Close()
+		stream.Close()
+	})
+	r.Acquire()
 	h.routes[path] = r
 
 	go func() {
 		streamer.Stream(stream)
 		h.mu.Lock()
+		defer h.mu.Unlock()
+		if r != h.routes[path] {
+			return
+		}
 		delete(h.routes, path)
 		h.mu.Unlock()
-		r.Stream.Close()
-		r.Streamer.Close()
+		streamer.Close()
+		stream.Close()
 	}()
 
 	return r, nil
@@ -151,18 +184,21 @@ func (h *ServerHandler) onStreamRequest(ctx *gortsplib.ServerHandlerOnDescribeCt
 		}, nil, err
 	}
 
-	r.count.Add(1)
 	context.AfterFunc(ud.ctx, func() {
-		if c := r.count.Add(-1); c > 0 {
+		h.mu.RLock()
+		r.expires.Store(time.Now().Add(30 * time.Second).UnixNano())
+		if r.Release() > 0 {
 			return
 		}
-		h.mu.Lock()
+		h.mu.RUnlock()
+		if !h.mu.TryLock() {
+			return
+		}
 		defer h.mu.Unlock()
 		if r.count.Load() > 0 {
 			return
 		}
-		delete(h.routes, ctx.Path)
-		r.Streamer.Close()
+		r.timer.Reset(30 * time.Second)
 	})
 
 	return &base.Response{
