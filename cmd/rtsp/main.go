@@ -5,8 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/url"
+	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/bluenviron/gortsplib/v5"
@@ -17,6 +20,26 @@ func main() {
 	listen := flag.String("listen", "", "Address for RTSP server")
 
 	flag.Parse()
+
+	// Set up logging based on LOGLEVEL environment variable
+	logLevel := os.Getenv("LOGLEVEL")
+	var level slog.Level
+	switch strings.ToLower(logLevel) {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	slog.SetDefault(logger)
+	slog.Debug("Logging initialized with level", "level", level)
 
 	ctx, _ := signal.NotifyContext(context.Background(), syscall.SIGINT)
 

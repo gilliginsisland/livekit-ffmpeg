@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -47,12 +47,12 @@ func (rs *RoomStreamer) onTrackSubscribed(track *webrtc.TrackRemote, pub *lksdk.
 	switch track.Kind() {
 	case webrtc.RTPCodecTypeAudio:
 		if !rs.audio.CompareAndSwap(nil, ts) {
-			log.Printf("Audio track skipped, already exists")
+			slog.Debug("audio track skipped", slog.String("reason", "already exists"))
 			return
 		}
 	case webrtc.RTPCodecTypeVideo:
 		if !rs.video.CompareAndSwap(nil, ts) {
-			log.Printf("Video track skipped, already exists")
+			slog.Debug("video track skipped", slog.String("reason", "already exists"))
 			return
 		}
 		go func() {

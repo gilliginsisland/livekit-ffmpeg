@@ -43,18 +43,23 @@ type route struct {
 	Streamer Streamer
 	Stream   *gortsplib.ServerStream
 	path     string
-	count    atomic.Int32
+	count    atomic.Int64
 	timer    *time.Timer
 	expires  atomic.Int64
+	logger   *slog.Logger
 }
 
-func (r *route) Acquire() int32 {
+func (r *route) Acquire() int64 {
 	r.timer.Stop()
-	return r.count.Add(1)
+	c := r.count.Add(1)
+	r.logger.Debug("route acquired", slog.Int64("refcount", c))
+	return c
 }
 
-func (r *route) Release() int32 {
-	return r.count.Add(-1)
+func (r *route) Release() int64 {
+	c := r.count.Add(-1)
+	r.logger.Debug("route released", slog.Int64("refcount", c))
+	return c
 }
 
 // UserData holds the context and cancel function for a connection.
@@ -137,34 +142,49 @@ func (h *ServerHandler) getOrCreateRoute(path string, query url.Values) (*route,
 		Streamer: streamer,
 		Stream:   stream,
 		path:     path,
+		logger:   slog.With(slog.String("path", path)),
 	}
 	r.timer = time.AfterFunc(30*time.Second, func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		if r != h.routes[path] || r.count.Load() > 0 || r.expires.Load() > time.Now().UnixNano() {
+		r.logger.Debug("timeout triggered")
+		if r != h.routes[path] {
+			r.logger.Debug("cleanup aborted", slog.String("reason", "orphaned route"))
+			return
+		}
+		if r.count.Load() > 0 {
+			r.logger.Debug("cleanup aborted", slog.String("reason", "non zero refcount"))
+			return
+		}
+		if r.expires.Load() > time.Now().UnixNano() {
+			r.logger.Debug("cleanup aborted", slog.String("reason", "expiration not reached"))
 			return
 		}
 		delete(h.routes, path)
-		h.mu.Unlock()
+		r.logger.Debug("route removed", slog.String("reason", "timeout"))
 		streamer.Close()
 		stream.Close()
 	})
-	r.Acquire()
 	h.routes[path] = r
+	r.logger.Debug("route created", slog.Int("refcount", 0))
 
 	go func() {
 		streamer.Stream(stream)
+		r.logger.Debug("stream completed")
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		if r != h.routes[path] {
+			r.logger.Debug("cleanup aborted", slog.String("reason", "orphaned route"))
 			return
 		}
 		delete(h.routes, path)
+		r.logger.Debug("route removed", slog.String("reason", "stream complete"))
 		h.mu.Unlock()
 		streamer.Close()
 		stream.Close()
 	}()
 
+	r.Acquire()
 	return r, nil
 }
 
@@ -185,12 +205,13 @@ func (h *ServerHandler) onStreamRequest(ctx *gortsplib.ServerHandlerOnDescribeCt
 	}
 
 	context.AfterFunc(ud.ctx, func() {
-		h.mu.RLock()
-		r.expires.Store(time.Now().Add(30 * time.Second).UnixNano())
-		if r.Release() > 0 {
+		expr := time.Now().Add(30 * time.Second).UnixNano()
+		r.expires.Store(expr)
+		r.logger.Debug("expiration updated", slog.Int64("expiration", expr))
+		c := r.Release()
+		if c > 0 {
 			return
 		}
-		h.mu.RUnlock()
 		if !h.mu.TryLock() {
 			return
 		}
@@ -199,6 +220,7 @@ func (h *ServerHandler) onStreamRequest(ctx *gortsplib.ServerHandlerOnDescribeCt
 			return
 		}
 		r.timer.Reset(30 * time.Second)
+		r.logger.Debug("timeout reset", slog.Int64("refcount", c))
 	})
 
 	return &base.Response{
@@ -208,13 +230,13 @@ func (h *ServerHandler) onStreamRequest(ctx *gortsplib.ServerHandlerOnDescribeCt
 
 // OnDescribe handles the RTSP DESCRIBE request, initializing the stream for the requested path if necessary.
 func (h *ServerHandler) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	slog.Debug("OnDescribe called for path:", ctx.Path)
+	slog.Debug("OnDescribe called", slog.String("path", ctx.Path))
 	return h.onStreamRequest(ctx)
 }
 
 // OnSetup handles the RTSP SETUP request, returning the stream for the requested path.
 func (h *ServerHandler) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	slog.Debug("OnSetup called for path:", ctx.Path)
+	slog.Debug("OnSetup called", slog.String("path", ctx.Path))
 	return h.onStreamRequest(&gortsplib.ServerHandlerOnDescribeCtx{
 		Conn:    ctx.Conn,
 		Request: ctx.Request,
@@ -239,12 +261,12 @@ func (h *ServerHandler) OnConnClose(ctx *gortsplib.ServerHandlerOnConnCloseCtx) 
 
 // OnRequest logs when a request is received from a connection.
 func (h *ServerHandler) OnRequest(conn *gortsplib.ServerConn, req *base.Request) {
-	slog.Debug("OnRequest called", slog.String("req", req.String()))
+	slog.Debug("request received", slog.String("request", req.String()))
 }
 
 // OnResponse logs when a response is sent to a connection.
 func (h *ServerHandler) OnResponse(conn *gortsplib.ServerConn, res *base.Response) {
-	slog.Debug("OnResponse called: %s", res)
+	slog.Debug("response sent", slog.String("response", res.String()))
 }
 
 // OnPlay logs when a PLAY request is received.
